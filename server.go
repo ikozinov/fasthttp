@@ -237,6 +237,12 @@ type Server struct {
 	// Server accepts all the requests by default.
 	GetOnly bool
 
+	// Reads encapsulated request and parses to EncapsulatedRequest if set to true
+	ReadEncapsulatedRequest bool
+
+	// Reads encapsulated request to body if set to true
+	ReadEncapsulatedRequestBody bool
+
 	// Logs all errors, including the most frequent
 	// 'connection reset by peer', 'broken pipe' and 'connection timeout'
 	// errors. Such errors are common in production serving real-world
@@ -385,6 +391,11 @@ type RequestCtx struct {
 	// Copying Response by value is forbidden. Use pointer to Response instead.
 	Response Response
 
+	// Encapsulated request
+	//
+	// Parusing encapsulated part to request
+	EncapsulatedRequest Request
+
 	userValues userData
 
 	lastReadDuration time.Duration
@@ -404,7 +415,19 @@ type RequestCtx struct {
 	timeoutCh       chan struct{}
 	timeoutTimer    *time.Timer
 
-	hijackHandler HijackHandler
+	encapsulatedHandler EncapsulatedHandler
+	hijackHandler       HijackHandler
+}
+
+// EncapsulatedHandler to proccedd encapsulate connections
+// mostly for use with http-like protocols (for ex. ICAP)
+type EncapsulatedHandler func(ctx *RequestCtx, w *bufio.Writer) bool
+
+// Encapsulate registers the given handler for connection encapsulating.
+//
+// The handler is called for writing to stream before actual response
+func (ctx *RequestCtx) Encapsulate(handler EncapsulatedHandler) {
+	ctx.encapsulatedHandler = handler
 }
 
 // HijackHandler must process the hijacked connection c.
@@ -1470,9 +1493,10 @@ func (s *Server) serveConn(c net.Conn) error {
 		br *bufio.Reader
 		bw *bufio.Writer
 
-		err             error
-		timeoutResponse *Response
-		hijackHandler   HijackHandler
+		err                 error
+		timeoutResponse     *Response
+		encapsulatedHandler EncapsulatedHandler
+		hijackHandler       HijackHandler
 
 		lastReadDeadlineTime  time.Time
 		lastWriteDeadlineTime time.Time
@@ -1510,6 +1534,16 @@ func (s *Server) serveConn(c net.Conn) error {
 			if br.Buffered() == 0 || err != nil {
 				releaseReader(s, br)
 				br = nil
+			} else {
+				if s.ReadEncapsulatedRequestBody == true {
+					if er, err := br.Peek(br.Buffered()); err == nil {
+						ctx.Request.AppendBody(er)
+					}
+				}
+
+				if s.ReadEncapsulatedRequest == true {
+					err = ctx.EncapsulatedRequest.Read(br)
+				}
 			}
 		}
 
@@ -1580,6 +1614,9 @@ func (s *Server) serveConn(c net.Conn) error {
 		}
 		ctx.Request.Reset()
 
+		encapsulatedHandler = ctx.encapsulatedHandler
+		ctx.encapsulatedHandler = nil
+
 		hijackHandler = ctx.hijackHandler
 		ctx.hijackHandler = nil
 
@@ -1612,6 +1649,26 @@ func (s *Server) serveConn(c net.Conn) error {
 		if bw == nil {
 			bw = acquireWriter(ctx)
 		}
+
+		if encapsulatedHandler != nil {
+			if nr := encapsulatedHandler(ctx, bw); nr == false {
+				ctx.Response.Reset()
+
+				if br == nil || connectionClose {
+					err = bw.Flush()
+					releaseWriter(s, bw)
+					bw = nil
+					if err != nil {
+						break
+					}
+					if connectionClose {
+						break
+					}
+				}
+				break
+			}
+		}
+
 		if err = writeResponse(ctx, bw); err != nil {
 			break
 		}
